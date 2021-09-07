@@ -1,0 +1,13 @@
+[package]
+name = "tracer_t"
+version = "0.1.0"
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow = "1.0.43"
+# Version from nix
+libc = { git = "https://github.com/rust-lang/libc", rev = "621a95373", features = [ "extra_traits" ] }
+# Nix needs #1515, #1516
+nix = { path = "../nix" }
