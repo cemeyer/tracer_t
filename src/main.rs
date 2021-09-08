@@ -256,14 +256,13 @@ fn print_result(ttl: u8, results: &Vec<ProbeResult>) {
     for r in results {
         match r {
             ProbeResult::Timeout => {
-                print!(" *.");
+                print!(" *");
             }
             ProbeResult::Response { from, error, terminal, print_unreach } => {
-                print!(" {}:", from);
+                print!(" {}", from);
                 if let Some(anno) = *print_unreach {
                     print_unreachable(anno);
                 }
-                print!(" {:?}, {}.", error, terminal);
             }
         }
     }
