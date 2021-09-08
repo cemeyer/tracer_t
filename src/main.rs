@@ -27,6 +27,7 @@ use std::env;
 use std::iter::FromIterator;
 use std::net::SocketAddr;
 use std::os::unix::prelude::*;
+use std::time::{Duration, Instant};
 use anyhow::Result;
 use nix::errno::Errno;
 use nix::poll::{self, PollFd, PollFlags};
@@ -46,7 +47,8 @@ struct Config {
 struct Probe {
     socket: RawFd,
     ttl: u8,
-    // timeout / elapsed?
+    // These are initialized None, then set to Some() on ::fire().
+    start: Option<Instant>,
 }
 
 impl Drop for Probe {
@@ -67,15 +69,15 @@ impl Probe {
         Ok(Self {
             socket,
             ttl,
+            start: None,
         })
     }
 
     fn fire(&mut self, config: &Config, dst: IpAddr) -> Result<()> {
         let dst = SockAddr::new_inet(InetAddr::new(dst, config.port_lo + self.ttl as u16));
+        let start = Instant::now();
+        self.start = Some(start);
         sendto(self.socket, &[1,2,3,4], &dst, MsgFlags::empty())?;
-
-        // XXX start elapsed timer, compute timeout Instant
-
         Ok(())
     }
 }
@@ -145,18 +147,19 @@ enum ProbeResult {
         terminal: bool,
 
         print_unreach: Option<IcmpCodeUnreach>,
+
+        latency_ms: f64,
     },
-    // latency?
 }
 
 impl ProbeResult {
-    fn from_ipv4(ee: &libc::sock_extended_err, addr: Option<libc::sockaddr_in>) -> Result<Self> {
+    fn from_ipv4(ee: &libc::sock_extended_err, addr: Option<libc::sockaddr_in>, duration: Duration) -> Result<Self> {
         let addr = addr.map(|s| IpAddr::V4(Ipv4Addr(s.sin_addr)))
             .ok_or(anyhow::Error::msg("missing origin"))?;
-        Ok(Self::from_ip(ee, addr))
+        Ok(Self::from_ip(ee, addr, duration))
     }
 
-    fn from_ip(ee: &libc::sock_extended_err, from: IpAddr) -> Self {
+    fn from_ip(ee: &libc::sock_extended_err, from: IpAddr, duration: Duration) -> Self {
         let mut terminal = false;
         let mut print_unreach = None;
 
@@ -177,11 +180,14 @@ impl ProbeResult {
             println!("Unexpected Icmp type {} (code {}) from {}", ee.ee_type, ee.ee_code, from);
         }
 
+        let latency_ms = (duration.as_nanos() as f64) / 1_000_000.;
+
         ProbeResult::Response {
             from,
             error: Errno::from_i32(ee.ee_errno as _),
             terminal,
             print_unreach,
+            latency_ms,
         }
     }
 }
@@ -196,6 +202,28 @@ struct State {
     last_printed: u8,
     // Printed a terminal line
     was_terminal: bool,
+}
+
+// Get the average latency of responses at some TTL, if there are any.
+fn avg_latency_ms(state: &State, ttl: u8) -> Option<f64> {
+    let results = &state.results[ttl as usize];
+    let mut divisor = 0;
+    let mut dividend = 0.;
+
+    for r in results {
+        match r {
+            ProbeResult::Timeout => (),
+            ProbeResult::Response { latency_ms, .. } => {
+                divisor += 1;
+                dividend += *latency_ms;
+            }
+        }
+    }
+
+    if divisor == 0 {
+        return None;
+    }
+    return Some(dividend / f64::from(divisor));
 }
 
 fn send_probes(config: &Config, state: &mut State, target: IpAddr) -> Result<()> {
@@ -253,13 +281,27 @@ fn print_unreachable(u: IcmpCodeUnreach) {
 // Print probe results for a single hop (one line)
 fn print_result(ttl: u8, results: &Vec<ProbeResult>) {
     print!(" {} ", ttl);
+
+    let mut prev_from = None;
     for r in results {
         match r {
             ProbeResult::Timeout => {
                 print!(" *");
             }
-            ProbeResult::Response { from, error, terminal, print_unreach } => {
-                print!(" {}", from);
+            ProbeResult::Response { from, print_unreach, latency_ms, .. } => {
+                // Coalesce responses from the same IP at the same TTL greedily.  If the sequence
+                // is A -> B -> A, we print all three times.  Normal traceroute is also this dumb,
+                // it's ok.
+                if prev_from != Some(from) {
+                    print!(" {}", from);
+                    prev_from = Some(from);
+                }
+                if *latency_ms > 1000. {
+                    let latency_s = latency_ms / 1000.;
+                    print!("  {:.3} s", latency_s);
+                } else {
+                    print!("  {:.3} ms", latency_ms);
+                }
                 if let Some(anno) = *print_unreach {
                     print_unreachable(anno);
                 }
@@ -304,12 +346,16 @@ fn process_ready_fd(config: &Config, state: &mut State, probe_idx: usize, buf: &
     let iovec = [IoVec::from_mut_slice(&mut buf.buf)];
     let msg = recvmsg(probe.socket, &iovec, Some(&mut buf.cmsg_space), MsgFlags::MSG_ERRQUEUE)?;
 
+    let probe_duration = probe.start.unwrap().elapsed();
+
     let mut res = false;
 
     for cmsg in msg.cmsgs() {
         match cmsg {
             ControlMessageOwned::Ipv4RecvErr(ee, addr) => {
-                state.results[probe.ttl as usize].push(ProbeResult::from_ipv4(&ee, addr)?);
+                state.results[probe.ttl as usize].push(
+                    ProbeResult::from_ipv4(&ee, addr, probe_duration)?
+                );
                 res = true;
             }
             _ => {
@@ -352,7 +398,11 @@ fn process_ready_fds(config: &Config, state: &mut State, ready: Vec<RawFd>) -> R
 
 fn main() -> Result<()> {
     let addr = IpAddr::from_std(&env::args().nth(1).unwrap().parse()?);
-    let config = Config { num_probes: 1, ttl_max: 12, port_lo: 33433, };
+    let config = Config {
+        num_probes: 3,
+        ttl_max: 12,
+        port_lo: 33433,
+    };
     let mut state = State {
         probes: Vec::new(),
         results: Vec::new(),
