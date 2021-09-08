@@ -40,6 +40,13 @@ struct Config {
     ttl_max: u8,
     num_probes: u32,
     port_lo: u16,
+
+    // Max timeout, in seconds
+    timo_max_s: f64,
+    // Relative timeout scaler (to other responses from the same gateway)
+    timo_here_mult: f64,
+    // Relative timeout scaler (to subsequent gateway(s) in the path)
+    timo_near_mult: f64,
 }
 
 // XXX: may be able to reduce number of sockets.
@@ -49,6 +56,8 @@ struct Probe {
     ttl: u8,
     // These are initialized None, then set to Some() on ::fire().
     start: Option<Instant>,
+    // Deadline can be updated to be sooner (here/near), but never later.
+    deadline: Option<Instant>,
 }
 
 impl Drop for Probe {
@@ -70,12 +79,14 @@ impl Probe {
             socket,
             ttl,
             start: None,
+            deadline: None,
         })
     }
 
     fn fire(&mut self, config: &Config, dst: IpAddr) -> Result<()> {
         let dst = SockAddr::new_inet(InetAddr::new(dst, config.port_lo + self.ttl as u16));
         let start = Instant::now();
+        self.deadline = Some(start + Duration::from_secs_f64(config.timo_max_s));
         self.start = Some(start);
         sendto(self.socket, &[1,2,3,4], &dst, MsgFlags::empty())?;
         Ok(())
@@ -202,28 +213,10 @@ struct State {
     last_printed: u8,
     // Printed a terminal line
     was_terminal: bool,
-}
-
-// Get the average latency of responses at some TTL, if there are any.
-fn avg_latency_ms(state: &State, ttl: u8) -> Option<f64> {
-    let results = &state.results[ttl as usize];
-    let mut divisor = 0;
-    let mut dividend = 0.;
-
-    for r in results {
-        match r {
-            ProbeResult::Timeout => (),
-            ProbeResult::Response { latency_ms, .. } => {
-                divisor += 1;
-                dividend += *latency_ms;
-            }
-        }
-    }
-
-    if divisor == 0 {
-        return None;
-    }
-    return Some(dividend / f64::from(divisor));
+    // [ttl] -> best observed latency ("here")
+    probe_lat_ms: Vec<Option<f64>>,
+    // [ttl] -> best observed future gateway latency ("near")
+    probe_near_lat_ms: Vec<Option<f64>>,
 }
 
 fn send_probes(config: &Config, state: &mut State, target: IpAddr) -> Result<()> {
@@ -241,10 +234,87 @@ fn send_probes(config: &Config, state: &mut State, target: IpAddr) -> Result<()>
     Ok(())
 }
 
-// XXX: global timeout?
+// Returns the nearest deadline, if any
+fn update_probe_deadlines(config: &Config, state: &mut State) -> Option<Duration> {
+    let now = Instant::now();
+    let mut nearest_deadline = None;
+
+    // Update deadlines against here/near factors
+    for probe in state.probes.iter_mut() {
+        let ttl = probe.ttl as usize;
+
+        let mut timo_s = config.timo_max_s;
+
+        // "here"
+        if let Some(lat_ms) = state.probe_lat_ms[ttl] {
+            let here_timo_s = lat_ms * config.timo_here_mult / 1_000.;
+            if here_timo_s < timo_s {
+                timo_s = here_timo_s;
+            }
+        }
+
+        // "near"
+        if let Some(lat_ms) = state.probe_near_lat_ms[ttl] {
+            let near_timo_s = lat_ms * config.timo_near_mult / 1_000.;
+            if near_timo_s < timo_s {
+                timo_s = near_timo_s;
+            }
+        }
+
+        let timo_deadline = probe.start.unwrap() + Duration::from_secs_f64(timo_s);
+        if timo_deadline < probe.deadline.unwrap() {
+            probe.deadline = Some(timo_deadline);
+        }
+
+        if probe.deadline.unwrap() > now {
+            if let Some(cur_deadline) = nearest_deadline {
+                use std::cmp::min;
+                nearest_deadline = Some(min(cur_deadline, probe.deadline.unwrap()));
+            } else {
+                nearest_deadline = probe.deadline;
+            }
+        }
+    }
+
+    nearest_deadline.map(|i| i.duration_since(now))
+}
+
+fn process_stale_probes(config: &Config, state: &mut State) {
+    let now = Instant::now();
+    let mut i = 0;
+    while i < state.probes.len() {
+        if state.probes[i].deadline.unwrap() < now {
+            let to_probe = state.probes.swap_remove(i);
+            state.results[to_probe.ttl as usize].push(ProbeResult::Timeout);
+            print_results(config, state, to_probe.ttl);
+        } else {
+            i += 1;
+        }
+    }
+}
+
 fn check_readiness(config: &Config, state: &mut State) -> Result<Vec<RawFd>> {
+    // Check for stale probes and induce timeouts
+    //  1. update deadlines against here/near factors
+    let until_nearest_deadline = update_probe_deadlines(config, state);
+    //  2. check for stale probes and cancel => result::timeout
+    process_stale_probes(config, state);
+    //  3. set poll timeout to that of nearest deadline, minus now.  min 1 to avoid spin
+    let poll_timo = if let Some(duration) = until_nearest_deadline {
+        let ms = duration.as_millis();
+        if ms < 1 {
+            1
+        } else if let Ok(ms32) = i32::try_from(ms) {
+            ms32
+        } else {
+            i32::MAX
+        }
+    } else {
+        1
+    };
+
     let mut pfds = state.probes.iter().map(|p| PollFd::new(p.socket, PollFlags::POLLIN)).collect::<Vec<_>>();
-    let n = poll::poll(&mut pfds, -1)?;
+    let n = poll::poll(&mut pfds, poll_timo)?;
 
     let mut res = Vec::with_capacity(n as usize);
     for pfd in pfds.iter() {
@@ -334,6 +404,26 @@ fn print_results(config: &Config, state: &mut State, probe_ttl: u8) {
     }
 }
 
+fn update_observed_lats_from(state: &mut State, ttl: u8) {
+    let ttl = usize::from(ttl);
+    let lat = match state.results[ttl].last().unwrap() {
+        ProbeResult::Response { latency_ms, .. } => *latency_ms,
+        _ => { panic!("invariant"); }
+    };
+
+    if state.probe_lat_ms[ttl].unwrap_or(f64::INFINITY) > lat {
+        state.probe_lat_ms[ttl] = Some(lat);
+
+        for ttl_i in (1..ttl).rev() {
+            if state.probe_near_lat_ms[ttl_i].unwrap_or(f64::INFINITY) > lat {
+                state.probe_near_lat_ms[ttl_i] = Some(lat);
+            } else {
+                break;
+            }
+        }
+    }
+}
+
 // Shared packet buffer reused between individual processing.
 struct RecvCache {
     buf: Vec<u8>,
@@ -343,6 +433,7 @@ struct RecvCache {
 // Process an fd.  If we should stop polling this fd, returns Ok(true).
 fn process_ready_fd(config: &Config, state: &mut State, probe_idx: usize, buf: &mut RecvCache) -> Result<bool> {
     let probe = &state.probes[probe_idx];
+    let probe_ttl = probe.ttl;
     let iovec = [IoVec::from_mut_slice(&mut buf.buf)];
     let msg = recvmsg(probe.socket, &iovec, Some(&mut buf.cmsg_space), MsgFlags::MSG_ERRQUEUE)?;
 
@@ -353,9 +444,10 @@ fn process_ready_fd(config: &Config, state: &mut State, probe_idx: usize, buf: &
     for cmsg in msg.cmsgs() {
         match cmsg {
             ControlMessageOwned::Ipv4RecvErr(ee, addr) => {
-                state.results[probe.ttl as usize].push(
+                state.results[probe_ttl as usize].push(
                     ProbeResult::from_ipv4(&ee, addr, probe_duration)?
                 );
+                update_observed_lats_from(state, probe_ttl);
                 res = true;
             }
             _ => {
@@ -365,7 +457,6 @@ fn process_ready_fd(config: &Config, state: &mut State, probe_idx: usize, buf: &
     }
 
     if res {
-        let probe_ttl = probe.ttl;
         print_results(config, state, probe_ttl);
     }
 
@@ -402,12 +493,21 @@ fn main() -> Result<()> {
         num_probes: 3,
         ttl_max: 12,
         port_lo: 33433,
+
+        // Same huge value as traceroute(8)
+        timo_max_s: 5.,
+        // Same defaults as traceroute(8)
+        timo_here_mult: 3.,
+        timo_near_mult: 10.,
     };
     let mut state = State {
         probes: Vec::new(),
         results: Vec::new(),
         last_printed: 0,
         was_terminal: false,
+
+        probe_lat_ms: vec![None; usize::from(config.ttl_max) + 1],
+        probe_near_lat_ms: vec![None; usize::from(config.ttl_max) + 1],
     };
 
     println!("tracer_t to {}, {} hops max", addr, config.ttl_max);
