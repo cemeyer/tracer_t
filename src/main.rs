@@ -81,15 +81,56 @@ impl Probe {
 }
 
 // ipv4
+#[derive(Clone, Debug, Copy)]
 enum IcmpType {
     Unreachable = 3,
     TimeExceeded = 11,
 }
+#[derive(Clone, Debug, Copy)]
 enum IcmpCodeUnreach {
+    Network = 0,
     Host = 1,
+    Protocol = 2,
     Port = 3,
+    FragNeeded = 4,
+    SourceRoute = 5,
+    DestNetUnknown = 6,
+    DestHostUnknown = 7,
+    SourceHostIso = 8,
+    DestAdminProhib = 9,
+    HostAdminProhib = 10,
+    NetTypeOfService = 11,
+    HostTypeOfService = 12,
     AdminProhib = 13,
+    HostPrecViol = 14,
+    PrecCutOff = 15,
 }
+
+impl IcmpCodeUnreach {
+    fn from_u8(val: u8) -> Result<Self> {
+        match val {
+            x if x == Self::Network           as u8 => Ok(Self::Network),
+            x if x == Self::Host              as u8 => Ok(Self::Host),
+            x if x == Self::Protocol          as u8 => Ok(Self::Protocol),
+            x if x == Self::Port              as u8 => Ok(Self::Port),
+            x if x == Self::FragNeeded        as u8 => Ok(Self::FragNeeded),
+            x if x == Self::SourceRoute       as u8 => Ok(Self::SourceRoute),
+            x if x == Self::DestNetUnknown    as u8 => Ok(Self::DestNetUnknown),
+            x if x == Self::DestHostUnknown   as u8 => Ok(Self::DestHostUnknown),
+            x if x == Self::SourceHostIso     as u8 => Ok(Self::SourceHostIso),
+            x if x == Self::DestAdminProhib   as u8 => Ok(Self::DestAdminProhib),
+            x if x == Self::HostAdminProhib   as u8 => Ok(Self::HostAdminProhib),
+            x if x == Self::NetTypeOfService  as u8 => Ok(Self::NetTypeOfService),
+            x if x == Self::HostTypeOfService as u8 => Ok(Self::HostTypeOfService),
+            x if x == Self::AdminProhib       as u8 => Ok(Self::AdminProhib),
+            x if x == Self::HostPrecViol      as u8 => Ok(Self::HostPrecViol),
+            x if x == Self::PrecCutOff        as u8 => Ok(Self::PrecCutOff),
+            _ => Err(anyhow::Error::msg(format!("bad code {}", val))),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Copy)]
 enum IcmpCodeTimeEx {
     Ttl = 0,
     FragmentReassmbly = 1,
@@ -102,7 +143,8 @@ enum ProbeResult {
         from: IpAddr,
         error: Errno,
         terminal: bool,
-        print_x: bool,
+
+        print_unreach: Option<IcmpCodeUnreach>,
     },
     // latency?
 }
@@ -116,25 +158,19 @@ impl ProbeResult {
 
     fn from_ip(ee: &libc::sock_extended_err, from: IpAddr) -> Self {
         let mut terminal = false;
-        let mut print_x = false;
+        let mut print_unreach = None;
 
         if ee.ee_type == IcmpType::Unreachable as _ {
-            if ee.ee_code == IcmpCodeUnreach::Host as _ {
-                println!(">> Unreachable host from {}", from);
-            } else if ee.ee_code == IcmpCodeUnreach::Port as _ {
-                //println!(">> Normal unreachable port from {}", from);
-                terminal = true;
-            } else if ee.ee_code == IcmpCodeUnreach::AdminProhib as _ {
-                println!(">> Unreachable via router (admin prohibited) from {}", from);
-                terminal = true;
-                print_x = true;
-            } else {
-                println!(">> Unreachable (code {}) from {}", ee.ee_code, from);
+            print_unreach = IcmpCodeUnreach::from_u8(ee.ee_code).ok();
+
+            match print_unreach {
+                Some(IcmpCodeUnreach::Port) | Some(IcmpCodeUnreach::AdminProhib) => {
+                    terminal = true;
+                }
+                _ => (),
             }
         } else if ee.ee_type == IcmpType::TimeExceeded as _ {
-            if ee.ee_code == IcmpCodeTimeEx::Ttl as _ {
-                //println!(">> Normal ttl exceeded from {}", from);
-            } else {
+            if ee.ee_code != IcmpCodeTimeEx::Ttl as _ {
                 println!(">> Time exceeded (code {}) from {}", ee.ee_code, from);
             }
         } else {
@@ -145,7 +181,7 @@ impl ProbeResult {
             from,
             error: Errno::from_i32(ee.ee_errno as _),
             terminal,
-            print_x,
+            print_unreach,
         }
     }
 }
@@ -192,6 +228,28 @@ fn check_readiness(config: &Config, state: &mut State) -> Result<Vec<RawFd>> {
     Ok(res)
 }
 
+fn print_unreachable(u: IcmpCodeUnreach) {
+    let s = match u {
+        IcmpCodeUnreach::Network => Some("N".into()),
+        IcmpCodeUnreach::Host => Some("H".into()),
+        IcmpCodeUnreach::Protocol => Some("P".into()),
+        IcmpCodeUnreach::SourceRoute => Some("S".into()),
+        IcmpCodeUnreach::FragNeeded => Some("F".into()),
+        IcmpCodeUnreach::AdminProhib => Some("X".into()),
+        IcmpCodeUnreach::HostPrecViol => Some("V".into()),
+        IcmpCodeUnreach::PrecCutOff => Some("C".into()),
+
+        // Expected, for the final packet.
+        IcmpCodeUnreach::Port => None,
+
+        _ => Some(format!("{}", u as u8)),
+    };
+
+    if let Some(anno) = s {
+        print!(" !{}", anno);
+    }
+}
+
 // Print probe results for a single hop (one line)
 fn print_result(ttl: u8, results: &Vec<ProbeResult>) {
     print!(" {} ", ttl);
@@ -200,9 +258,12 @@ fn print_result(ttl: u8, results: &Vec<ProbeResult>) {
             ProbeResult::Timeout => {
                 print!(" *.");
             }
-            ProbeResult::Response { from, error, terminal, print_x } => {
-                let x = if *print_x { " !X" } else { "" };
-                print!(" {}:{} {:?}, {}.", from, x, error, terminal);
+            ProbeResult::Response { from, error, terminal, print_unreach } => {
+                print!(" {}:", from);
+                if let Some(anno) = *print_unreach {
+                    print_unreachable(anno);
+                }
+                print!(" {:?}, {}.", error, terminal);
             }
         }
     }
