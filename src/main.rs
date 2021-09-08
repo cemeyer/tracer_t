@@ -80,6 +80,21 @@ impl Probe {
     }
 }
 
+// ipv4
+enum IcmpType {
+    Unreachable = 3,
+    TimeExceeded = 11,
+}
+enum IcmpCodeUnreach {
+    Host = 1,
+    Port = 3,
+    AdminProhib = 13,
+}
+enum IcmpCodeTimeEx {
+    Ttl = 0,
+    FragmentReassmbly = 1,
+}
+
 #[derive(Clone, Debug, Copy)]
 enum ProbeResult {
     Timeout,
@@ -90,6 +105,49 @@ enum ProbeResult {
         print_x: bool,
     },
     // latency?
+}
+
+impl ProbeResult {
+    fn from_ipv4(ee: &libc::sock_extended_err, addr: Option<libc::sockaddr_in>) -> Result<Self> {
+        let addr = addr.map(|s| IpAddr::V4(Ipv4Addr(s.sin_addr)))
+            .ok_or(anyhow::Error::msg("missing origin"))?;
+        Ok(Self::from_ip(ee, addr))
+    }
+
+    fn from_ip(ee: &libc::sock_extended_err, from: IpAddr) -> Self {
+        let mut terminal = false;
+        let mut print_x = false;
+
+        if ee.ee_type == IcmpType::Unreachable as _ {
+            if ee.ee_code == IcmpCodeUnreach::Host as _ {
+                println!(">> Unreachable host from {}", from);
+            } else if ee.ee_code == IcmpCodeUnreach::Port as _ {
+                //println!(">> Normal unreachable port from {}", from);
+                terminal = true;
+            } else if ee.ee_code == IcmpCodeUnreach::AdminProhib as _ {
+                println!(">> Unreachable via router (admin prohibited) from {}", from);
+                terminal = true;
+                print_x = true;
+            } else {
+                println!(">> Unreachable (code {}) from {}", ee.ee_code, from);
+            }
+        } else if ee.ee_type == IcmpType::TimeExceeded as _ {
+            if ee.ee_code == IcmpCodeTimeEx::Ttl as _ {
+                //println!(">> Normal ttl exceeded from {}", from);
+            } else {
+                println!(">> Time exceeded (code {}) from {}", ee.ee_code, from);
+            }
+        } else {
+            println!("Unexpected Icmp type {} (code {}) from {}", ee.ee_type, ee.ee_code, from);
+        }
+
+        ProbeResult::Response {
+            from,
+            error: Errno::from_i32(ee.ee_errno as _),
+            terminal,
+            print_x,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -134,6 +192,7 @@ fn check_readiness(config: &Config, state: &mut State) -> Result<Vec<RawFd>> {
     Ok(res)
 }
 
+// Print probe results for a single hop (one line)
 fn print_result(ttl: u8, results: &Vec<ProbeResult>) {
     print!(" {} ", ttl);
     for r in results {
@@ -150,25 +209,33 @@ fn print_result(ttl: u8, results: &Vec<ProbeResult>) {
     println!();
 }
 
+// Print any complete result lines available (in order)
+fn print_results(config: &Config, state: &mut State, probe_ttl: u8) {
+    for (ttl, results) in state.results.iter().enumerate().skip(probe_ttl as _) {
+        let ttl = u8::try_from(ttl).unwrap();
+        if results.len() == config.num_probes as _ && state.last_printed + 1 == ttl {
+            print_result(ttl, results);
+            state.last_printed += 1;
+
+            if results.iter().any(|r| {
+                match r {
+                    ProbeResult::Response { terminal, .. } => *terminal,
+                    _ => false,
+                }
+            }) {
+                state.was_terminal = true;
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+}
+
 // Shared packet buffer reused between individual processing.
 struct RecvCache {
     buf: Vec<u8>,
     cmsg_space: Vec<u8>,
-}
-
-// ipv4
-enum IcmpType {
-    Unreachable = 3,
-    TimeExceeded = 11,
-}
-enum IcmpCodeUnreach {
-    Host = 1,
-    Port = 3,
-    AdminProhib = 13,
-}
-enum IcmpCodeTimeEx {
-    Ttl = 0,
-    FragmentReassmbly = 1,
 }
 
 // Process an fd.  If we should stop polling this fd, returns Ok(true).
@@ -182,68 +249,18 @@ fn process_ready_fd(config: &Config, state: &mut State, probe_idx: usize, buf: &
     for cmsg in msg.cmsgs() {
         match cmsg {
             ControlMessageOwned::Ipv4RecvErr(ee, addr) => {
-                let addr = addr.map(|s| IpAddr::V4(Ipv4Addr(s.sin_addr)))
-                    .ok_or(anyhow::Error::msg("missing origin"))?;
-
-                let mut terminal = false;
-                let mut print_x = false;
-
-                if ee.ee_type == IcmpType::Unreachable as _ {
-                    if ee.ee_code == IcmpCodeUnreach::Host as _ {
-                        println!(">> Unreachable host from {}", addr);
-                    } else if ee.ee_code == IcmpCodeUnreach::Port as _ {
-                        //println!(">> Normal unreachable port from {}", addr);
-                        terminal = true;
-                    } else if ee.ee_code == IcmpCodeUnreach::AdminProhib as _ {
-                        println!(">> Unreachable via router (admin prohibited) from {}", addr);
-                        terminal = true;
-                        print_x = true;
-                    } else {
-                        println!(">> Unreachable (code {}) from {}", ee.ee_code, addr);
-                    }
-                } else if ee.ee_type == IcmpType::TimeExceeded as _ {
-                    if ee.ee_code == IcmpCodeTimeEx::Ttl as _ {
-                        //println!(">> Normal ttl exceeded from {}", addr);
-                    } else {
-                        println!(">> Time exceeded (code {}) from {}", ee.ee_code, addr);
-                    }
-                } else {
-                    println!("Unexpected Icmp type {} (code {}) from {}", ee.ee_type, ee.ee_code, addr);
-                }
-
-                let ttl_results = &mut state.results[probe.ttl as usize];
-                ttl_results.push(ProbeResult::Response {
-                    from: addr,
-                    error: Errno::from_i32(ee.ee_errno as _),
-                    terminal,
-                    print_x,
-                });
-                for (ttl, results) in state.results.iter().enumerate().skip(probe.ttl as _) {
-                    let ttl = u8::try_from(ttl).unwrap();
-                    if results.len() == config.num_probes as _ && state.last_printed + 1 == ttl {
-                        print_result(ttl, results);
-                        state.last_printed += 1;
-
-                        if results.iter().any(|r| {
-                            match r {
-                                ProbeResult::Response { terminal, .. } => *terminal,
-                                _ => false,
-                            }
-                        }) {
-                            state.was_terminal = true;
-                            break;
-                        }
-                    } else {
-                        break;
-                    }
-                }
-
+                state.results[probe.ttl as usize].push(ProbeResult::from_ipv4(&ee, addr)?);
                 res = true;
             }
             _ => {
                 println!("Unexpected cmsg {:?}", cmsg);
             }
         }
+    }
+
+    if res {
+        let probe_ttl = probe.ttl;
+        print_results(config, state, probe_ttl);
     }
 
     Ok(res)
