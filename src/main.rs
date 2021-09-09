@@ -29,7 +29,6 @@ use std::net::SocketAddr;
 use std::os::unix::prelude::*;
 use std::time::{Duration, Instant};
 use anyhow::Result;
-use nix::errno::Errno;
 use nix::poll::{self, PollFd, PollFlags};
 use nix::sys::socket::{self, *};
 use nix::sys::uio::IoVec;
@@ -67,14 +66,28 @@ impl Drop for Probe {
 }
 
 impl Probe {
-    fn new(ttl: u8) -> Result<Self> {
-        let socket = socket::socket(AddressFamily::Inet,
-                                    SockType::Datagram,
-                                    SockFlag::SOCK_NONBLOCK,
-                                    None)?;
-        setsockopt(socket, sockopt::Ipv4RecvErr, &true).unwrap();
+    fn new(target: &IpAddr, ttl: u8) -> Result<Self> {
         let ttl32 = i32::from(ttl);
-        setsockopt(socket, sockopt::Ipv4Ttl, &ttl32).unwrap();
+        let socket = match target {
+            IpAddr::V4(_) => {
+                let socket = socket::socket(AddressFamily::Inet,
+                                            SockType::Datagram,
+                                            SockFlag::SOCK_NONBLOCK,
+                                            None)?;
+                setsockopt(socket, sockopt::Ipv4RecvErr, &true).unwrap();
+                setsockopt(socket, sockopt::Ipv4Ttl, &ttl32).unwrap();
+                socket
+            }
+            IpAddr::V6(_) => {
+                let socket = socket::socket(AddressFamily::Inet6,
+                                            SockType::Datagram,
+                                            SockFlag::SOCK_NONBLOCK,
+                                            None)?;
+                setsockopt(socket, sockopt::Ipv6RecvErr, &true).unwrap();
+                setsockopt(socket, sockopt::Ipv6Ttl, &ttl32).unwrap();
+                socket
+            }
+        };
         Ok(Self {
             socket,
             ttl,
@@ -99,6 +112,7 @@ enum IcmpType {
     Unreachable = 3,
     TimeExceeded = 11,
 }
+
 #[derive(Clone, Debug, Copy)]
 enum IcmpCodeUnreach {
     Network = 0,
@@ -119,8 +133,10 @@ enum IcmpCodeUnreach {
     PrecCutOff = 15,
 }
 
-impl IcmpCodeUnreach {
-    fn from_u8(val: u8) -> Result<Self> {
+impl TryFrom<u8> for IcmpCodeUnreach {
+    type Error = u8;
+
+    fn try_from(val: u8) -> Result<Self, u8> {
         match val {
             x if x == Self::Network           as u8 => Ok(Self::Network),
             x if x == Self::Host              as u8 => Ok(Self::Host),
@@ -138,7 +154,16 @@ impl IcmpCodeUnreach {
             x if x == Self::AdminProhib       as u8 => Ok(Self::AdminProhib),
             x if x == Self::HostPrecViol      as u8 => Ok(Self::HostPrecViol),
             x if x == Self::PrecCutOff        as u8 => Ok(Self::PrecCutOff),
-            _ => Err(anyhow::Error::msg(format!("bad code {}", val))),
+            _ => Err(val),
+        }
+    }
+}
+
+impl IcmpCodeUnreach {
+    fn from_v6_result(val: Result<Icmpv6CodeUnreach, u8>) -> Result<Self, u8> {
+        match val {
+            Ok(code) => Self::try_from(code),
+            Err(int) => Err(int),
         }
     }
 }
@@ -146,7 +171,103 @@ impl IcmpCodeUnreach {
 #[derive(Clone, Debug, Copy)]
 enum IcmpCodeTimeEx {
     Ttl = 0,
-    FragmentReassmbly = 1,
+    FragmentReassembly = 1,
+}
+
+impl TryFrom<u8> for IcmpCodeTimeEx {
+    type Error = u8;
+
+    fn try_from(val: u8) -> Result<Self, u8> {
+        match val {
+            x if x == Self::Ttl                as u8 => Ok(Self::Ttl),
+            x if x == Self::FragmentReassembly as u8 => Ok(Self::FragmentReassembly),
+            _ => Err(val),
+        }
+    }
+}
+
+// ipv6
+#[derive(Clone, Debug, Copy)]
+enum Icmpv6Type {
+    Unreachable = 1,
+    TimeExceeded = 3,
+}
+
+#[derive(Clone, Debug, Copy)]
+enum Icmpv6CodeUnreach {
+    NoRoute = 0,
+    AdminProhib = 1,
+    SourceScope = 2,
+    Host = 3,
+    Port = 4,
+    SourcePolicy = 5,
+    RejectRoute = 6,
+    SourceRoute = 7,
+}
+
+impl TryFrom<u8> for Icmpv6CodeUnreach {
+    type Error = u8;
+
+    fn try_from(val: u8) -> Result<Self, u8> {
+        match val {
+            x if x == Self::NoRoute      as u8 => Ok(Self::NoRoute),
+            x if x == Self::AdminProhib  as u8 => Ok(Self::AdminProhib),
+            x if x == Self::SourceScope  as u8 => Ok(Self::SourceScope),
+            x if x == Self::Host         as u8 => Ok(Self::Host),
+            x if x == Self::Port         as u8 => Ok(Self::Port),
+            x if x == Self::SourcePolicy as u8 => Ok(Self::SourcePolicy),
+            x if x == Self::RejectRoute  as u8 => Ok(Self::RejectRoute),
+            x if x == Self::SourceRoute  as u8 => Ok(Self::SourceRoute),
+            _ => Err(val),
+        }
+    }
+}
+
+impl TryFrom<Icmpv6CodeUnreach> for IcmpCodeUnreach {
+    type Error = u8;
+
+    fn try_from(v6: Icmpv6CodeUnreach) -> Result<Self, u8> {
+        match v6 {
+            Icmpv6CodeUnreach::NoRoute      => Ok(Self::Network),
+            Icmpv6CodeUnreach::AdminProhib  => Ok(Self::AdminProhib),
+            Icmpv6CodeUnreach::Host         => Ok(Self::Host),
+            Icmpv6CodeUnreach::Port         => Ok(Self::Port),
+            Icmpv6CodeUnreach::SourceRoute  => Ok(Self::SourceRoute),
+            _ => Err(v6 as u8),
+        }
+    }
+}
+
+type Icmpv6CodeTimeEx = IcmpCodeTimeEx;
+
+// Common v4-v6 abstraction.  Not especially general, but good enough for traceroute.
+enum Icmp {
+    Unreachable(Result<IcmpCodeUnreach, u8>),
+    TimeExceeded(Result<IcmpCodeTimeEx, u8>),
+    Unrecognized(u8, u8),
+}
+
+impl Icmp {
+    fn from_v4(type_: u8, code: u8) -> Self {
+        if type_ == IcmpType::Unreachable as _ {
+            Icmp::Unreachable(IcmpCodeUnreach::try_from(code))
+        } else if type_ == IcmpType::TimeExceeded as _ {
+            Icmp::TimeExceeded(IcmpCodeTimeEx::try_from(code))
+        } else {
+            Icmp::Unrecognized(type_, code)
+        }
+    }
+
+    fn from_v6(type_: u8, code: u8) -> Self {
+        if type_ == Icmpv6Type::Unreachable as _ {
+            let code6 = Icmpv6CodeUnreach::try_from(code);
+            Icmp::Unreachable(IcmpCodeUnreach::from_v6_result(code6))
+        } else if type_ == Icmpv6Type::TimeExceeded as _ {
+            Icmp::TimeExceeded(Icmpv6CodeTimeEx::try_from(code))
+        } else {
+            Icmp::Unrecognized(type_, code)
+        }
+    }
 }
 
 #[derive(Clone, Debug, Copy)]
@@ -154,10 +275,9 @@ enum ProbeResult {
     Timeout,
     Response {
         from: IpAddr,
-        error: Errno,
         terminal: bool,
 
-        print_unreach: Option<IcmpCodeUnreach>,
+        print_unreach: Option<Result<IcmpCodeUnreach, u8>>,
 
         latency_ms: f64,
     },
@@ -167,35 +287,49 @@ impl ProbeResult {
     fn from_ipv4(ee: &libc::sock_extended_err, addr: Option<libc::sockaddr_in>, duration: Duration) -> Result<Self> {
         let addr = addr.map(|s| IpAddr::V4(Ipv4Addr(s.sin_addr)))
             .ok_or(anyhow::Error::msg("missing origin"))?;
-        Ok(Self::from_ip(ee, addr, duration))
+        let icmp = Icmp::from_v4(ee.ee_type, ee.ee_code);
+        Ok(Self::from_ip(icmp, addr, duration))
     }
 
-    fn from_ip(ee: &libc::sock_extended_err, from: IpAddr, duration: Duration) -> Self {
+    fn from_ipv6(ee: &libc::sock_extended_err, addr: Option<libc::sockaddr_in6>, duration: Duration) -> Result<Self> {
+        let addr = addr.map(|s| IpAddr::V6(Ipv6Addr(s.sin6_addr)))
+            .ok_or(anyhow::Error::msg("missing origin"))?;
+        let icmp = Icmp::from_v6(ee.ee_type, ee.ee_code);
+        Ok(Self::from_ip(icmp, addr, duration))
+    }
+
+    fn from_ip(icmp: Icmp, from: IpAddr, duration: Duration) -> Self {
         let mut terminal = false;
         let mut print_unreach = None;
 
-        if ee.ee_type == IcmpType::Unreachable as _ {
-            print_unreach = IcmpCodeUnreach::from_u8(ee.ee_code).ok();
+        match icmp {
+            Icmp::Unreachable(code) => {
+                print_unreach = Some(code);
 
-            match print_unreach {
-                Some(IcmpCodeUnreach::Port) | Some(IcmpCodeUnreach::AdminProhib) => {
-                    terminal = true;
+                match code {
+                    Ok(IcmpCodeUnreach::Port) | Ok(IcmpCodeUnreach::AdminProhib) => {
+                        terminal = true;
+                    }
+                    _ => (),
                 }
-                _ => (),
             }
-        } else if ee.ee_type == IcmpType::TimeExceeded as _ {
-            if ee.ee_code != IcmpCodeTimeEx::Ttl as _ {
-                println!(">> Time exceeded (code {}) from {}", ee.ee_code, from);
+            Icmp::TimeExceeded(code) => {
+                match code {
+                    Ok(IcmpCodeTimeEx::Ttl) => (),
+                    _ => {
+                        println!(">> Time exceeded (code {:?}) from {}", code, from);
+                    }
+                }
             }
-        } else {
-            println!("Unexpected Icmp type {} (code {}) from {}", ee.ee_type, ee.ee_code, from);
+            Icmp::Unrecognized(type_, code) => {
+                println!("Unexpected Icmp type {} (code {}) from {}", type_, code, from);
+            }
         }
 
         let latency_ms = (duration.as_nanos() as f64) / 1_000_000.;
 
         ProbeResult::Response {
             from,
-            error: Errno::from_i32(ee.ee_errno as _),
             terminal,
             print_unreach,
             latency_ms,
@@ -223,7 +357,7 @@ fn send_probes(config: &Config, state: &mut State, target: IpAddr) -> Result<()>
     state.results.resize(usize::from(config.ttl_max) + 1, Vec::new());
     for ttl in 1..=config.ttl_max {
         for probe in 0..config.num_probes {
-            state.probes.push(Probe::new(ttl)?);
+            state.probes.push(Probe::new(&target, ttl)?);
         }
     }
 
@@ -326,21 +460,22 @@ fn check_readiness(config: &Config, state: &mut State) -> Result<Vec<RawFd>> {
     Ok(res)
 }
 
-fn print_unreachable(u: IcmpCodeUnreach) {
+fn print_unreachable(u: Result<IcmpCodeUnreach, u8>) {
     let s = match u {
-        IcmpCodeUnreach::Network => Some("N".into()),
-        IcmpCodeUnreach::Host => Some("H".into()),
-        IcmpCodeUnreach::Protocol => Some("P".into()),
-        IcmpCodeUnreach::SourceRoute => Some("S".into()),
-        IcmpCodeUnreach::FragNeeded => Some("F".into()),
-        IcmpCodeUnreach::AdminProhib => Some("X".into()),
-        IcmpCodeUnreach::HostPrecViol => Some("V".into()),
-        IcmpCodeUnreach::PrecCutOff => Some("C".into()),
+        Ok(IcmpCodeUnreach::Network) => Some("N".into()),
+        Ok(IcmpCodeUnreach::Host) => Some("H".into()),
+        Ok(IcmpCodeUnreach::Protocol) => Some("P".into()),
+        Ok(IcmpCodeUnreach::SourceRoute) => Some("S".into()),
+        Ok(IcmpCodeUnreach::FragNeeded) => Some("F".into()),
+        Ok(IcmpCodeUnreach::AdminProhib) => Some("X".into()),
+        Ok(IcmpCodeUnreach::HostPrecViol) => Some("V".into()),
+        Ok(IcmpCodeUnreach::PrecCutOff) => Some("C".into()),
 
         // Expected, for the final packet.
-        IcmpCodeUnreach::Port => None,
+        Ok(IcmpCodeUnreach::Port) => None,
 
-        _ => Some(format!("{}", u as u8)),
+        Ok(v) => Some(format!("{}", v as u8)),
+        Err(v) => Some(format!("{}", v as u8)),
     };
 
     if let Some(anno) = s {
@@ -450,6 +585,13 @@ fn process_ready_fd(config: &Config, state: &mut State, probe_idx: usize, buf: &
                 update_observed_lats_from(state, probe_ttl);
                 res = true;
             }
+            ControlMessageOwned::Ipv6RecvErr(ee, addr) => {
+                state.results[probe_ttl as usize].push(
+                    ProbeResult::from_ipv6(&ee, addr, probe_duration)?
+                );
+                update_observed_lats_from(state, probe_ttl);
+                res = true;
+            }
             _ => {
                 println!("Unexpected cmsg {:?}", cmsg);
             }
@@ -469,7 +611,8 @@ fn process_ready_fds(config: &Config, state: &mut State, ready: Vec<RawFd>) -> R
     let ready = HashSet::<_>::from_iter(ready);
     let mut recvbuf = RecvCache {
         buf: vec![0u8; 576],
-        cmsg_space: nix::cmsg_space!(libc::sock_extended_err, libc::sockaddr_in),
+        // sockaddr_in6 is bigger than sockaddr_in, so it works for either version.
+        cmsg_space: nix::cmsg_space!(libc::sock_extended_err, libc::sockaddr_in6),
     };
 
     let mut i = 0;
